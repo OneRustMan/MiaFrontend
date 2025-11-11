@@ -1,9 +1,23 @@
 import { useEffect, useRef, useState } from "react";
 import { useChat } from "../hooks/useChat";
 
-// ========= Config de API (opcional) =========
-const API_BASE =
-  (import.meta && import.meta.env && import.meta.env.VITE_API_BASE) || "";
+// ========= Detección del backend =========
+function detectApiBase() {
+  // Si definiste VITE_API_BASE, úsalo
+  // Si no, asume mismo host pero puerto 3000 (útil en dev)
+  const envBase =
+    (import.meta && import.meta.env && import.meta.env.VITE_API_BASE) || "";
+  if (envBase) return envBase;
+  try {
+    const u = new URL(window.location.href);
+    // Si ya estás en :3000, usa mismo origen; si no, fuerza :3000
+    if (u.port === "3000") return `${u.protocol}//${u.host}`;
+    return `${u.protocol}//${u.hostname}:3000`;
+  } catch {
+    return ""; // fallback al mismo origen (si hay proxy)
+  }
+}
+const API_BASE = detectApiBase();
 
 // Helper para elegir un MIME soportado por el navegador
 function pickMimeType() {
@@ -34,11 +48,18 @@ function blobToDataURL(blob) {
   });
 }
 
+// Reset robusto (con cache-bust) + body (mejor con keepalive)
 async function resetSessionClient(reason = "frontend") {
   try {
-    const r = await fetch(`${API_BASE}/reset`, { method: "POST" });
+    const url = `${API_BASE}/reset?ts=${Date.now()}`;
+    const r = await fetch(url, {
+      method: "POST",
+      keepalive: true,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    });
     const j = await r.json().catch(() => ({}));
-    console.log(`[reset] (${reason})`, r.status, j);
+    console.log(`[reset->${url}] (${reason})`, r.status, j);
     return j;
   } catch (e) {
     console.warn("[reset] failed:", e);
@@ -47,10 +68,9 @@ async function resetSessionClient(reason = "frontend") {
 }
 
 export const UI = ({ hidden, ...props }) => {
-  // input: mantiene tu audio temporal (y ahora también un subobjeto con el timer)
   const input = useRef(null);
-
   const { chat, loading, cameraZoomed, setCameraZoomed, message } = useChat();
+
   const [isRecording, setIsRecording] = useState(false);
   const [recordingUrl, setRecordingUrl] = useState(null);
   const [status, setStatus] = useState("");
@@ -69,12 +89,28 @@ export const UI = ({ hidden, ...props }) => {
     const id = setInterval(() => {
       setCounterSec((prev) => {
         const next = prev + 1;
+
+        // Cuando se alcanza 5:00 disparamos RESET inmediato al backend
         if (next >= 300) {
-          hasHitFiveRef.current = true; // alcanzó 5:00
+          hasHitFiveRef.current = true;
+
+          // Marca en input (por si alguien lee esa ref)
           if (!input.current) input.current = {};
           input.current.inputTimer = { hasHitFive: true, lastCounter: 0 };
-          return 0; // reinicia el contador visible en UI
+
+          // Dispara reset al backend en el mismo momento (fire-and-forget)
+          resetSessionClient("auto-expire-timer");
+
+          // Muestra aviso en la UI
+          try {
+            alert("Sesión reiniciada por inactividad (≥ 5 min). Se limpió audio e historial.");
+          } catch {}
+
+          // Reinicia el contador visible
+          return 0;
         }
+
+        // Antes de los 5 min, solo actualiza la marca
         if (!input.current) input.current = {};
         input.current.inputTimer = {
           hasHitFive: hasHitFiveRef.current,
@@ -83,29 +119,15 @@ export const UI = ({ hidden, ...props }) => {
         return next;
       });
     }, 1000);
+
     return () => clearInterval(id);
   }, []);
   // =============================================================
 
-  // Al cerrar/recargar pestaña → intentar reset (best-effort con keepalive)
-  useEffect(() => {
-    const onBeforeUnload = () => {
-      try {
-        navigator.sendBeacon?.(`${API_BASE}/reset`, new Blob([], { type: "application/json" }));
-      } catch {
-        fetch(`${API_BASE}/reset`, { method: "POST", keepalive: true }).catch(() => {});
-      }
-    };
-    window.addEventListener("beforeunload", onBeforeUnload);
-    return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, []);
-
   // Limpia stream/recursos previos
   const cleanup = () => {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      try {
-        mediaRecorderRef.current.stop();
-      } catch {}
+      try { mediaRecorderRef.current.stop(); } catch {}
     }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
@@ -120,7 +142,6 @@ export const UI = ({ hidden, ...props }) => {
       setRecordingUrl(null);
     }
     if (input?.current && input.current.blob) {
-      // Mantén input.current (obj) porque ahora también guarda inputTimer
       const timerCopy = input.current.inputTimer;
       input.current = { inputTimer: timerCopy };
     }
@@ -154,7 +175,6 @@ export const UI = ({ hidden, ...props }) => {
         setIsRecording(false);
         setStatus("Listo");
 
-        // Guarda en input.current el audio SIN tocar el contador
         if (!input.current) input.current = {};
         input.current.blob = blob;
         input.current.url = url;
@@ -174,7 +194,6 @@ export const UI = ({ hidden, ...props }) => {
     }
   };
 
-  // Detiene la grabación actual (si la hay)
   const stopRecording = () => {
     const mr = mediaRecorderRef.current;
     if (mr && mr.state !== "inactive") {
@@ -182,7 +201,6 @@ export const UI = ({ hidden, ...props }) => {
     }
   };
 
-  // Toggle grabar/detener. Si se vuelve a iniciar: reemplaza la anterior
   const toggleRecord = () => {
     if (isRecording) {
       stopRecording();
@@ -191,45 +209,31 @@ export const UI = ({ hidden, ...props }) => {
     }
   };
 
-  // Enviar: si han pasado 5 min → reset y NO se envía. Si se envía, tras éxito resetea contador local.
+  // Enviar: si han pasado 5 min → NO se envía (ya se reseteó automático).
   const sendMessage = async () => {
     if (loading || message) return;
 
-    // El frontend es el que decide si expiró
     if (hasHitFiveRef.current || input.current?.inputTimer?.hasHitFive) {
-      await resetSessionClient("send-blocked-expired");
-      alert("Sesión reiniciada por inactividad (≥ 5 min). Se limpió audio e historial.");
-      // limpiar estado local básico
+      // Ya hubo reset automático; solo limpia estado local y libera marca.
       if (input.current) input.current = {};
       setRecordingUrl(null);
       setStatus("Reiniciada");
-      setCounterSec(0);
       hasHitFiveRef.current = false;
-      return; // ❗ No continuar con chat
+      if (!input.current) input.current = {};
+      input.current.inputTimer = { hasHitFive: false, lastCounter: counterSec };
+      return;
     }
 
-    // si hay audio grabado, lo mandamos como Data URL
     if (input.current?.blob) {
       try {
         const dataUrl = await blobToDataURL(input.current.blob);
-        await chat(dataUrl); // el backend solo procesa; NO controla el tiempo
-        // tras actividad exitosa, resetea contador
-        setCounterSec(0);
-        hasHitFiveRef.current = false;
-        if (!input.current) input.current = {};
-        input.current.inputTimer = { hasHitFive: false, lastCounter: 0 };
+        await chat(dataUrl); // backend solo procesa; el tiempo lo controla el frontend
       } catch (e) {
         console.error("Error preparando audio:", e);
         alert("No se pudo preparar el audio para enviar.");
       }
     } else {
-      // si no hay audio, envía texto vacío (o lo que quieras)
       await chat("");
-      // tras actividad, resetea contador
-      setCounterSec(0);
-      hasHitFiveRef.current = false;
-      if (!input.current) input.current = {};
-      input.current.inputTimer = { hasHitFive: false, lastCounter: 0 };
     }
   };
 
@@ -267,7 +271,6 @@ export const UI = ({ hidden, ...props }) => {
               </span>
             )}
           </div>
-          {/* Barra de progreso */}
           <div className="mt-2 h-1.5 w-full bg-gray-200 rounded">
             <div
               className={`h-1.5 rounded ${
@@ -328,7 +331,6 @@ export const UI = ({ hidden, ...props }) => {
 
         {/* Zona de grabación + envío */}
         <div className="flex items-center gap-3 pointer-events-auto max-w-screen-sm w-full mx-auto">
-          {/* Botón Grabar / Detener */}
           <button
             onClick={toggleRecord}
             className={`p-4 px-6 font-semibold uppercase rounded-md transition
@@ -340,7 +342,6 @@ export const UI = ({ hidden, ...props }) => {
             {isRecording ? "⏺ Grabando…" : "🎙️ Grabar Audio"}
           </button>
 
-          {/* Estado + Player cuando ya se grabó */}
           <div className="flex flex-col items-start">
             {status && <span className="text-sm text-gray-700">{status}</span>}
             {recordingUrl && !isRecording && (
@@ -348,7 +349,6 @@ export const UI = ({ hidden, ...props }) => {
             )}
           </div>
 
-          {/* Enviar */}
           <button
             disabled={loading || message}
             onClick={sendMessage}
