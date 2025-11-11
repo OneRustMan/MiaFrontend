@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useChat } from "../hooks/useChat";
 
+// ========= Config de API (opcional) =========
+const API_BASE =
+  (import.meta && import.meta.env && import.meta.env.VITE_API_BASE) || "";
+
 // Helper para elegir un MIME soportado por el navegador
 function pickMimeType() {
   const candidates = [
@@ -21,6 +25,27 @@ function formatTime(total) {
   return `${mm}:${ss}`;
 }
 
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onerror = reject;
+    r.onload = () => resolve(r.result); // "data:audio/webm;base64,...."
+    r.readAsDataURL(blob);
+  });
+}
+
+async function resetSessionClient(reason = "frontend") {
+  try {
+    const r = await fetch(`${API_BASE}/reset`, { method: "POST" });
+    const j = await r.json().catch(() => ({}));
+    console.log(`[reset] (${reason})`, r.status, j);
+    return j;
+  } catch (e) {
+    console.warn("[reset] failed:", e);
+    return null;
+  }
+}
+
 export const UI = ({ hidden, ...props }) => {
   // input: mantiene tu audio temporal (y ahora también un subobjeto con el timer)
   const input = useRef(null);
@@ -36,20 +61,19 @@ export const UI = ({ hidden, ...props }) => {
 
   const mimeType = pickMimeType();
 
-  // ================== CONTADOR INDEPENDIENTE (no afecta la grabación) ==================
-  const [counterSec, setCounterSec] = useState(0);           // muestra mm:ss
-  const hasHitFiveRef = useRef(false);                       // true si alguna vez llegó a 5 min
+  // ================== CONTADOR (solo frontend) ==================
+  const [counterSec, setCounterSec] = useState(0); // muestra mm:ss
+  const hasHitFiveRef = useRef(false); // true si alcanzó 5:00 al menos una vez
 
   useEffect(() => {
-    // Arranca al montar. Reinicia a 0 en cada recarga (estado inicial)
     const id = setInterval(() => {
       setCounterSec((prev) => {
         const next = prev + 1;
-        if (next >= 300) {     // 5:00
-          hasHitFiveRef.current = true; // marcar que se alcanzó al menos una vez
+        if (next >= 300) {
+          hasHitFiveRef.current = true; // alcanzó 5:00
           if (!input.current) input.current = {};
           input.current.inputTimer = { hasHitFive: true, lastCounter: 0 };
-          return 0;            // reinicia el contador
+          return 0; // reinicia el contador visible en UI
         }
         if (!input.current) input.current = {};
         input.current.inputTimer = {
@@ -59,15 +83,29 @@ export const UI = ({ hidden, ...props }) => {
         return next;
       });
     }, 1000);
-
     return () => clearInterval(id);
   }, []);
-  // =====================================================================================
+  // =============================================================
+
+  // Al cerrar/recargar pestaña → intentar reset (best-effort con keepalive)
+  useEffect(() => {
+    const onBeforeUnload = () => {
+      try {
+        navigator.sendBeacon?.(`${API_BASE}/reset`, new Blob([], { type: "application/json" }));
+      } catch {
+        fetch(`${API_BASE}/reset`, { method: "POST", keepalive: true }).catch(() => {});
+      }
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, []);
 
   // Limpia stream/recursos previos
   const cleanup = () => {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      try { mediaRecorderRef.current.stop(); } catch {}
+      try {
+        mediaRecorderRef.current.stop();
+      } catch {}
     }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
@@ -116,7 +154,7 @@ export const UI = ({ hidden, ...props }) => {
         setIsRecording(false);
         setStatus("Listo");
 
-        // Guarda en input.current el audio SIN tocar el contador independiente
+        // Guarda en input.current el audio SIN tocar el contador
         if (!input.current) input.current = {};
         input.current.blob = blob;
         input.current.url = url;
@@ -153,21 +191,51 @@ export const UI = ({ hidden, ...props }) => {
     }
   };
 
-  // Enviar (placeholder): NO afecta el contador; si quieres usar el flag, está en:
-  // hasHitFiveRef.current  ó  input.current?.inputTimer?.hasHitFive
-  const sendMessage = () => {
-    if (!loading && !message) {
-      if (input.current?.blob) {
-        chat("[voice message ready]");
-      } else {
-        chat("");
+  // Enviar: si han pasado 5 min → reset y NO se envía. Si se envía, tras éxito resetea contador local.
+  const sendMessage = async () => {
+    if (loading || message) return;
+
+    // El frontend es el que decide si expiró
+    if (hasHitFiveRef.current || input.current?.inputTimer?.hasHitFive) {
+      await resetSessionClient("send-blocked-expired");
+      alert("Sesión reiniciada por inactividad (≥ 5 min). Se limpió audio e historial.");
+      // limpiar estado local básico
+      if (input.current) input.current = {};
+      setRecordingUrl(null);
+      setStatus("Reiniciada");
+      setCounterSec(0);
+      hasHitFiveRef.current = false;
+      return; // ❗ No continuar con chat
+    }
+
+    // si hay audio grabado, lo mandamos como Data URL
+    if (input.current?.blob) {
+      try {
+        const dataUrl = await blobToDataURL(input.current.blob);
+        await chat(dataUrl); // el backend solo procesa; NO controla el tiempo
+        // tras actividad exitosa, resetea contador
+        setCounterSec(0);
+        hasHitFiveRef.current = false;
+        if (!input.current) input.current = {};
+        input.current.inputTimer = { hasHitFive: false, lastCounter: 0 };
+      } catch (e) {
+        console.error("Error preparando audio:", e);
+        alert("No se pudo preparar el audio para enviar.");
       }
+    } else {
+      // si no hay audio, envía texto vacío (o lo que quieras)
+      await chat("");
+      // tras actividad, resetea contador
+      setCounterSec(0);
+      hasHitFiveRef.current = false;
+      if (!input.current) input.current = {};
+      input.current.inputTimer = { hasHitFive: false, lastCounter: 0 };
     }
   };
 
   if (hidden) return null;
 
-  // -------- Colores dinámicos del contador (esclavo de color) --------
+  // -------- Colores dinámicos del contador --------
   let timerColor =
     counterSec < 60
       ? "text-emerald-700"
@@ -183,11 +251,10 @@ export const UI = ({ hidden, ...props }) => {
       : "bg-red-100 text-red-700";
 
   const progressPct = Math.min(100, Math.round((counterSec / 300) * 100));
-  // -------------------------------------------------------------------
 
   return (
     <>
-      {/* === CONTADOR SUPERIOR FIJO (independiente) === */}
+      {/* === CONTADOR SUPERIOR FIJO (frontend-only) === */}
       <div className="fixed top-4 right-4 z-50 w-[180px]">
         <div className="bg-white/80 backdrop-blur-md rounded-lg shadow-md px-4 py-2">
           <div className="flex items-center justify-between">
@@ -281,7 +348,7 @@ export const UI = ({ hidden, ...props }) => {
             )}
           </div>
 
-          {/* Enviar (placeholder si quieres mandar el audio) */}
+          {/* Enviar */}
           <button
             disabled={loading || message}
             onClick={sendMessage}
