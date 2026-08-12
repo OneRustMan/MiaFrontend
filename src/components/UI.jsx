@@ -282,11 +282,7 @@ export const UI = ({ hidden, ...props }) => {
             <span className={`font-mono text-lg ${timerColor}`}>
               {formatTime(counterSec)}
             </span>
-            {hasHitFiveRef.current && (
-              <span className={`text-[10px] px-2 py-0.5 rounded ${chipBg}`}>
-                ≥5 min
-              </span>
-            )}
+            {hasHitFiveRef.current}
           </div>
           <div className="mt-2 h-1.5 w-full bg-gray-200 rounded">
             <div
