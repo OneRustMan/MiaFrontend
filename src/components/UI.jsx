@@ -85,6 +85,7 @@ export const UI = ({ hidden, ...props }) => {
   // ================== CONTADOR (solo frontend) ==================
   const [counterSec, setCounterSec] = useState(0); // muestra mm:ss
   const hasHitFiveRef = useRef(false); // true si alcanzó 5:00 al menos una vez
+  const lastResetAtRef = useRef(0); // timestamp del último reset automático
 
   // Aviso visual de nueva sesión (reemplaza al alert() nativo)
   const [showResetToast, setShowResetToast] = useState(false);
@@ -113,6 +114,7 @@ export const UI = ({ hidden, ...props }) => {
     }
 
     hasHitFiveRef.current = true;
+    lastResetAtRef.current = Date.now();
 
     // Marca en input (por si alguien lee esa ref)
     input.current.inputTimer = { hasHitFive: true, lastCounter: 0 };
@@ -218,14 +220,16 @@ export const UI = ({ hidden, ...props }) => {
   const sendMessage = async () => {
     if (loading || message) return;
 
-    if (hasHitFiveRef.current || input.current?.inputTimer?.hasHitFive) {
-      // Ya hubo reset automático; solo limpia estado local y libera marca.
-      if (input.current) input.current = {};
+    // Solo se descarta la grabación si es anterior al último reset automático.
+    const isStaleRecording =
+      input.current?.blob &&
+      input.current?.createdAt &&
+      input.current.createdAt < lastResetAtRef.current;
+
+    if (isStaleRecording) {
+      input.current = {};
       setRecordingUrl(null);
       setStatus("Reiniciada");
-      hasHitFiveRef.current = false;
-      if (!input.current) input.current = {};
-      input.current.inputTimer = { hasHitFive: false, lastCounter: counterSec };
       return;
     }
 

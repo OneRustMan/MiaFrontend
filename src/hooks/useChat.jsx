@@ -7,16 +7,20 @@ const ChatContext = createContext();
 export const ChatProvider = ({ children }) => {
   const chat = async (message) => {
     setLoading(true);
-    const data = await fetch(`${backendUrl}/chat`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ message }),
-    });
-    const resp = (await data.json()).messages;
-    setMessages((messages) => [...messages, ...resp]);
-    setLoading(false);
+    try {
+      const data = await fetch(`${backendUrl}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+      });
+      const json = await data.json().catch(() => ({}));
+      if (json.aborted) return; // sesión reseteada mientras procesaba, no hay nada que reproducir
+      setMessages((messages) => [...messages, ...(json.messages || [])]);
+    } catch (e) {
+      console.error("Error en chat():", e);
+    } finally {
+      setLoading(false);
+    }
   };
   const [messages, setMessages] = useState([]);
   const [message, setMessage] = useState();
