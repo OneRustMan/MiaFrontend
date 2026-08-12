@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useChat } from "../hooks/useChat";
+import { SessionResetToast } from "./SessionResetToast";
 
 // ========= Detección del backend =========
 function detectApiBase() {
@@ -85,43 +86,47 @@ export const UI = ({ hidden, ...props }) => {
   const [counterSec, setCounterSec] = useState(0); // muestra mm:ss
   const hasHitFiveRef = useRef(false); // true si alcanzó 5:00 al menos una vez
 
+  // Aviso visual de nueva sesión (reemplaza al alert() nativo)
+  const [showResetToast, setShowResetToast] = useState(false);
+  const [resetToastKey, setResetToastKey] = useState(0); // remonta el toast para reiniciar su animación
+
+  // Tick puro: el intervalo solo avanza el contador, sin efectos secundarios.
   useEffect(() => {
     const id = setInterval(() => {
-      setCounterSec((prev) => {
-        const next = prev + 1;
-
-        // Cuando se alcanza 5:00 disparamos RESET inmediato al backend
-        if (next >= 300) {
-          hasHitFiveRef.current = true;
-
-          // Marca en input (por si alguien lee esa ref)
-          if (!input.current) input.current = {};
-          input.current.inputTimer = { hasHitFive: true, lastCounter: 0 };
-
-          // Dispara reset al backend en el mismo momento (fire-and-forget)
-          resetSessionClient("auto-expire-timer");
-
-          // Muestra aviso en la UI
-          try {
-            alert("Sesión reiniciada por inactividad (≥ 5 min). Se limpió audio e historial.");
-          } catch {}
-
-          // Reinicia el contador visible
-          return 0;
-        }
-
-        // Antes de los 5 min, solo actualiza la marca
-        if (!input.current) input.current = {};
-        input.current.inputTimer = {
-          hasHitFive: hasHitFiveRef.current,
-          lastCounter: next,
-        };
-        return next;
-      });
+      setCounterSec((prev) => prev + 1);
     }, 1000);
 
     return () => clearInterval(id);
   }, []);
+
+  // Efectos secundarios del contador, fuera del updater de setState.
+  useEffect(() => {
+    if (!input.current) input.current = {};
+
+    // Antes de los 5 min, solo actualiza la marca
+    if (counterSec < 300) {
+      input.current.inputTimer = {
+        hasHitFive: hasHitFiveRef.current,
+        lastCounter: counterSec,
+      };
+      return;
+    }
+
+    hasHitFiveRef.current = true;
+
+    // Marca en input (por si alguien lee esa ref)
+    input.current.inputTimer = { hasHitFive: true, lastCounter: 0 };
+
+    // Dispara reset al backend en el mismo momento (fire-and-forget)
+    resetSessionClient("auto-expire-timer");
+
+    // Muestra aviso en la UI (toast propio, no bloqueante)
+    setShowResetToast(true);
+    setResetToastKey((k) => k + 1);
+
+    // Reinicia el contador visible
+    setCounterSec(0);
+  }, [counterSec]);
   // =============================================================
 
   // Limpia stream/recursos previos
@@ -258,6 +263,14 @@ export const UI = ({ hidden, ...props }) => {
 
   return (
     <>
+      {/* === AVISO DE NUEVA SESIÓN === */}
+      {showResetToast && (
+        <SessionResetToast
+          key={resetToastKey}
+          onClose={() => setShowResetToast(false)}
+        />
+      )}
+
       {/* === CONTADOR SUPERIOR FIJO (frontend-only) === */}
       <div className="fixed top-4 right-4 z-50 w-[180px]">
         <div className="bg-white/80 backdrop-blur-md rounded-lg shadow-md px-4 py-2">
