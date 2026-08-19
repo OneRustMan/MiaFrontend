@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { useChat } from "../hooks/useChat";
-import { SessionResetToast } from "./SessionResetToast";
 
 // ========= Detección del backend =========
 function detectApiBase() {
@@ -83,13 +82,11 @@ export const UI = ({ hidden, ...props }) => {
   const mimeType = pickMimeType();
 
   // ================== CONTADOR (solo frontend) ==================
-  const [counterSec, setCounterSec] = useState(0); // muestra mm:ss
-  const hasHitFiveRef = useRef(false); // true si alcanzó 5:00 al menos una vez
-  const lastResetAtRef = useRef(0); // timestamp del último reset automático
+  const [counterSec, setCounterSec] = useState(0); // muestra mm:ss, puramente informativo
+  const lastResetAtRef = useRef(0); // timestamp del último reset (manual)
 
-  // Aviso visual de nueva sesión (reemplaza al alert() nativo)
-  const [showResetToast, setShowResetToast] = useState(false);
-  const [resetToastKey, setResetToastKey] = useState(0); // remonta el toast para reiniciar su animación
+  // Reset manual en curso (deshabilita el botón mientras se llama al backend)
+  const [isResetting, setIsResetting] = useState(false);
 
   // Tick puro: el intervalo solo avanza el contador, sin efectos secundarios.
   useEffect(() => {
@@ -100,35 +97,26 @@ export const UI = ({ hidden, ...props }) => {
     return () => clearInterval(id);
   }, []);
 
-  // Efectos secundarios del contador, fuera del updater de setState.
+  // Sincroniza la marca de tiempo en input en cada tick.
+  // Las sesiones no tienen límite: no hay ningún disparo automático de reset.
   useEffect(() => {
     if (!input.current) input.current = {};
-
-    // Antes de los 5 min, solo actualiza la marca
-    if (counterSec < 300) {
-      input.current.inputTimer = {
-        hasHitFive: hasHitFiveRef.current,
-        lastCounter: counterSec,
-      };
-      return;
-    }
-
-    hasHitFiveRef.current = true;
-    lastResetAtRef.current = Date.now();
-
-    // Marca en input (por si alguien lee esa ref)
-    input.current.inputTimer = { hasHitFive: true, lastCounter: 0 };
-
-    // Dispara reset al backend en el mismo momento (fire-and-forget)
-    resetSessionClient("auto-expire-timer");
-
-    // Muestra aviso en la UI (toast propio, no bloqueante)
-    setShowResetToast(true);
-    setResetToastKey((k) => k + 1);
-
-    // Reinicia el contador visible
-    setCounterSec(0);
+    input.current.inputTimer = { lastCounter: counterSec };
   }, [counterSec]);
+
+  // Reset manual: mismo mecanismo que usaba el reset automático.
+  const handleManualReset = async () => {
+    if (isResetting) return;
+    setIsResetting(true);
+    try {
+      // Marca el corte ANTES de esperar: cualquier grabación previa queda stale.
+      lastResetAtRef.current = Date.now();
+      await resetSessionClient("manual-staff");
+      setCounterSec(0);
+    } finally {
+      setIsResetting(false);
+    }
+  };
   // =============================================================
 
   // Limpia stream/recursos previos
@@ -216,11 +204,11 @@ export const UI = ({ hidden, ...props }) => {
     }
   };
 
-  // Enviar: si han pasado 5 min → NO se envía (ya se reseteó automático).
+  // Enviar: si la grabación es previa al último reset manual → NO se envía.
   const sendMessage = async () => {
     if (loading || message) return;
 
-    // Solo se descarta la grabación si es anterior al último reset automático.
+    // Solo se descarta la grabación si es anterior al último reset.
     const isStaleRecording =
       input.current?.blob &&
       input.current?.createdAt &&
@@ -248,54 +236,14 @@ export const UI = ({ hidden, ...props }) => {
 
   if (hidden) return null;
 
-  // -------- Colores dinámicos del contador --------
-  let timerColor =
-    counterSec < 60
-      ? "text-emerald-700"
-      : counterSec < 240
-      ? "text-amber-700"
-      : "text-red-700";
-
-  let chipBg =
-    counterSec < 60
-      ? "bg-emerald-100 text-emerald-700"
-      : counterSec < 240
-      ? "bg-amber-100 text-amber-700"
-      : "bg-red-100 text-red-700";
-
-  const progressPct = Math.min(100, Math.round((counterSec / 300) * 100));
-
   return (
     <>
-      {/* === AVISO DE NUEVA SESIÓN === */}
-      {showResetToast && (
-        <SessionResetToast
-          key={resetToastKey}
-          onClose={() => setShowResetToast(false)}
-        />
-      )}
-
-      {/* === CONTADOR SUPERIOR FIJO (frontend-only) === */}
+      {/* === CONTADOR SUPERIOR FIJO (frontend-only, informativo) === */}
       <div className="fixed top-4 right-4 z-50 w-[180px]">
         <div className="bg-white/80 backdrop-blur-md rounded-lg shadow-md px-4 py-2">
-          <div className="flex items-center justify-between">
-            <span className={`font-mono text-lg ${timerColor}`}>
-              {formatTime(counterSec)}
-            </span>
-            {hasHitFiveRef.current}
-          </div>
-          <div className="mt-2 h-1.5 w-full bg-gray-200 rounded">
-            <div
-              className={`h-1.5 rounded ${
-                counterSec < 60
-                  ? "bg-emerald-500"
-                  : counterSec < 240
-                  ? "bg-amber-500"
-                  : "bg-red-500"
-              }`}
-              style={{ width: `${progressPct}%` }}
-            />
-          </div>
+          <span className="font-mono text-lg text-gray-700">
+            {formatTime(counterSec)}
+          </span>
         </div>
       </div>
 
@@ -361,6 +309,16 @@ export const UI = ({ hidden, ...props }) => {
               <audio className="mt-1 h-10" controls src={recordingUrl} />
             )}
           </div>
+
+          <button
+            disabled={isResetting}
+            onClick={handleManualReset}
+            className={`bg-pink-500 hover:bg-pink-600 text-white p-4 px-6 font-semibold uppercase rounded-md ${
+              isResetting ? "cursor-not-allowed opacity-30" : ""
+            }`}
+          >
+            {isResetting ? "Reiniciando..." : "Reiniciar sesión"}
+          </button>
 
           <button
             disabled={loading || message}
