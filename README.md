@@ -1,10 +1,9 @@
-# r3f-vite-starter
-A boilerplate to build R3F projects
+Base del proyecto: wass08 <https://github.com/wass08>\
 
+Hice un fork inicial del repositorio <https://github.com/wass08/r3f-virtual-girlfriend-backend>
+
+Start the development server with
 ```
 yarn
 yarn dev
 ```
-
-
-![image](https://user-images.githubusercontent.com/6551176/221732091-23ee52cb-4150-42fa-b998-43628d7a6b0d.png)
