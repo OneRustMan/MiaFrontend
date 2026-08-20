@@ -4,6 +4,13 @@ const backendUrl = import.meta.env.VITE_API_URL || "http://localhost:3000";
 
 const EMOTIONS = ["alegría", "amor", "tristeza", "ira", "miedo", "sorpresa", "default"];
 
+// MIA, por diseño de personaje, siempre responde con calidez: su propia
+// emoción de respuesta solo toma tres valores reales (ver getVoiceSettingsForEmotion
+// en emotion.service.js): "alegría" y "amor", que tienen ajuste de voz propio, y
+// "default", el caso base/neutral del else final. El resto de categorías
+// (tristeza, ira, miedo, sorpresa) nunca se encienden acá, así que no se renderizan.
+const MIA_EMOTIONS = ["alegría", "amor", "default"];
+
 // Acento por emoción para que el resaltado se lea de lejos en el stand.
 const EMOTION_STYLES = {
   alegría: "bg-amber-400 text-amber-950 ring-amber-300",
@@ -16,18 +23,18 @@ const EMOTION_STYLES = {
 };
 
 // Exportado para poder probar el resaltado de chips sin montar el SSE.
-export const EmotionRow = ({ label, active }) => {
+export const EmotionRow = ({ label, active, emotions = EMOTIONS }) => {
   // El vocabulario real de sentimientos vive en ModelomIA (proyecto aparte):
-  // cualquier valor fuera de EMOTIONS ("neutral", o uno futuro) se muestra
-  // igual como chip extra en estilo neutro, en vez de dejar la fila apagada.
-  const isUnknown = active != null && !EMOTIONS.includes(active);
+  // cualquier valor fuera de la lista de la fila ("neutral", o uno futuro) se
+  // muestra igual como chip extra en estilo neutro, en vez de dejar la fila apagada.
+  const isUnknown = active != null && !emotions.includes(active);
   return (
     <div className="flex-1 min-w-[280px] rounded-xl bg-white/90 backdrop-blur-md ring-1 ring-pink-200 shadow-lg shadow-pink-900/10 p-5">
       <p className="text-sm font-semibold uppercase tracking-widest text-pink-500 mb-3">
         {label}
       </p>
       <div className="flex flex-wrap gap-2">
-        {EMOTIONS.map((emotion) => {
+        {emotions.map((emotion) => {
           const isActive = active === emotion;
           return (
             <span
@@ -116,7 +123,7 @@ export default function DashboardView() {
       {/* Indicadores de emoción */}
       <section className="flex flex-wrap gap-6">
         <EmotionRow label="Emoción detectada" active={sentimiento} />
-        <EmotionRow label="Respuesta de MIA" active={miaEmocion} />
+        <EmotionRow label="Respuesta de MIA" active={miaEmocion} emotions={MIA_EMOTIONS} />
       </section>
 
       {/* Respuesta de MIA */}
