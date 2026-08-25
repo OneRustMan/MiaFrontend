@@ -106,6 +106,15 @@ const corresponding = {
 
 let setupMode = false;
 
+/**
+ * Cuánto se deja a la vista un mensaje que llegó sin audio antes de avanzar la
+ * cola. No es un tiempo de reproducción — no hay nada que reproducir — sino el
+ * mínimo para que la expresión y la animación de ese chunk se alcancen a ver.
+ * Con 0, un turno entero degradado se vaciaría en un par de frames y el avatar
+ * volvería a Idle sin que se notara que MIA contestó algo.
+ */
+const SILENT_MESSAGE_MS = 600;
+
 export function Avatar(props) {
   const { nodes, materials, scene } = useGLTF(
     "/models/64f1a714fe61576b46f27ca2.glb"
@@ -123,6 +132,24 @@ export function Avatar(props) {
     }
     setAnimation(message.animation);
     setFacialExpression(message.facialExpression);
+
+    // Un chunk puede llegar sin audio: si el TTS falla, el backend degrada y
+    // manda el texto igual (turnPipeline.service.js). Sin esta rama,
+    // "data:audio/mp3;base64," + undefined arma una fuente inválida, play()
+    // rechaza, onended no se dispara NUNCA y la cola se queda clavada en este
+    // mensaje para siempre — con ella, todo lo que espera a que se vacíe.
+    if (!message.audio) {
+      // Sin audio no hay tiempos que seguir. Apagar el lipsync es obligatorio,
+      // no cosmético: el bucle de render lee audio.currentTime cuando hay
+      // message y lipsync, así que si quedara puesto leería el currentTime del
+      // audio anterior (o rompería por frame si no hubo ninguno).
+      setLipsync(undefined);
+      setAudio(undefined);
+      // Se avanza igual, como si este mensaje ya hubiera terminado de sonar.
+      const timer = setTimeout(onMessagePlayed, SILENT_MESSAGE_MS);
+      return () => clearTimeout(timer);
+    }
+
     setLipsync(message.lipsync);
     const audio = new Audio("data:audio/mp3;base64," + message.audio);
     audio.play();
