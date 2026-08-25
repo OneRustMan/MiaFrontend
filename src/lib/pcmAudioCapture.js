@@ -24,6 +24,64 @@ export const TARGET_SAMPLE_RATE = 24000;
 /** Cada cuánto emite el worklet un chunk nuevo. */
 const DEFAULT_CHUNK_MS = 100;
 
+// ─── Calibración de la detección de silencio ─────────────────────────────────
+// El umbral NO es un número fijo: se mide al arrancar cada sesión.
+//
+// Por qué: la primera versión usaba -50 dBFS fijo y falló contra un ambiente
+// real. El ruido de fondo de ese cuarto vivía por encima de -50, así que todos
+// los bloques daban "voz", el contador de silencio se reiniciaba en cada bloque
+// y el corte automático no se disparó nunca — el usuario hizo su pausa y el
+// detector no la vio. Un umbral absoluto no distingue "ruido de fondo constante"
+// de "está hablando"; lo que las distingue es cuánto se despega la voz del piso
+// de ruido de esa sesión.
+//
+// Cómo: el worklet mide el ambiente durante NOISE_CALIBRATION_MS al arrancar y
+// fija umbral = piso + NOISE_MARGIN_DB, acotado a [MIN_THRESHOLD_DB, MAX_THRESHOLD_DB].
+//
+//  - Margen chico (ej. 5 dB) → el propio ruido de fondo lo cruza al fluctuar y
+//    vuelve el problema original.
+//  - Margen grande (ej. 20 dB) → una frase dicha en voz baja queda por debajo
+//    del umbral y cuenta como silencio: corta a mitad de la oración.
+//  - Duración corta (ej. 800 ms) → interrumpe en las pausas normales del habla.
+//  - Duración larga (ej. 4000 ms) → silencio muerto antes de que MIA conteste.
+
+/**
+ * Umbral fijo de FALLBACK. Solo se usa si la calibración no llega a correr
+ * (el tramo inicial no juntó bloques suficientes).
+ */
+export const SILENCE_THRESHOLD_DB = -50;
+
+/** Cuánto silencio consecutivo hace falta para cortar el turno. */
+export const SILENCE_DURATION_MS = 2500;
+
+/** Cuánto audio se mide al arrancar para estimar el piso de ruido. */
+export const NOISE_CALIBRATION_MS = 1000;
+
+/** Cuánto por encima del piso medido tiene que estar un bloque para contar como voz. */
+export const NOISE_MARGIN_DB = 11;
+
+/**
+ * Rango de seguridad del umbral calibrado.
+ *  - Por debajo de MIN: sala muy silenciosa; bajar más no aporta y expone a que
+ *    cualquier microfluctuación cuente como voz.
+ *  - Por encima de MAX: el ambiente es tan ruidoso que el umbral se metería en
+ *    el rango de una voz normal y empezaría a cortar a mitad de frase. Se avisa
+ *    por consola, porque en ese ambiente esta técnica ya está al límite.
+ */
+export const MIN_THRESHOLD_DB = -60;
+export const MAX_THRESHOLD_DB = -30;
+
+/**
+ * Mínimo de bloques medidos para que la calibración se considere válida.
+ * Un bloque de AudioWorklet son 128 muestras (~2,7 ms a 48 kHz), así que un
+ * segundo real da unos 375; con menos de 50 la mediana no significa nada y
+ * conviene el fallback.
+ */
+const MIN_CALIBRATION_BLOCKS = 50;
+
+/** Cada cuánto reporta el worklet el nivel medido (0 = no reportar). */
+const DEFAULT_LEVEL_REPORT_MS = 0;
+
 const PROCESSOR_NAME = "mia-pcm-capture";
 
 // El worklet vive en public/ (ver el comentario largo en el propio archivo).
@@ -43,14 +101,34 @@ const WORKLET_URL = `${import.meta.env.BASE_URL || "/"}mia-pcm-worklet.js`;
  * @param {MediaStream} opts.stream          Stream del micrófono.
  * @param {(chunk: Uint8Array) => void} opts.onAudioChunk  Recibe cada chunk ya en PCM16 LE mono 24k.
  * @param {number}   [opts.chunkMs]          Tamaño del chunk en ms (default 100).
+ * @param {(info: object) => void} [opts.onSilenceDetected]  Se dispara UNA vez por turno, cuando el
+ *        worklet lleva `silenceDurationMs` seguidos por debajo de `silenceThresholdDb`. Para que
+ *        vuelva a dispararse hay que llamar a resetSilenceDetection().
+ * @param {(info: {db:number, silent:boolean, silentMs:number}) => void} [opts.onLevel]  Nivel medido
+ *        en vivo; solo se emite si levelReportMs > 0. Sirve para calibrar el umbral.
+ * @param {(info: object) => void} [opts.onCalibrated]  Resultado de la medición del piso de ruido:
+ *        { ok, floorDb, marginDb, rawThresholdDb, thresholdDb, clampedAt, blocks }.
+ * @param {number}   [opts.silenceThresholdDb]  Umbral fijo de fallback. Default SILENCE_THRESHOLD_DB.
+ * @param {number}   [opts.silenceDurationMs]   Default SILENCE_DURATION_MS.
+ * @param {number}   [opts.calibrationMs]       Tramo de medición del piso (0 = sin calibrar).
+ * @param {number}   [opts.noiseMarginDb]       Margen sobre el piso medido.
+ * @param {number}   [opts.levelReportMs]       Cada cuánto emitir onLevel (0 = nunca).
  * @param {(err: Error) => void} [opts.onError]
  * @param {(info: object) => void} [opts.onReady]  Recibe la frecuencia real detectada y el factor usado.
- * @returns {{ start: () => Promise<object>, stop: () => Promise<void>, isRunning: () => boolean, getSampleRate: () => number|null }}
+ * @returns {{ start: () => Promise<object>, stop: () => Promise<void>, resetSilenceDetection: () => boolean, isRunning: () => boolean, getSampleRate: () => number|null }}
  */
 export function createPcmAudioCapture({
   stream,
   onAudioChunk,
   chunkMs = DEFAULT_CHUNK_MS,
+  onSilenceDetected,
+  onLevel,
+  onCalibrated,
+  silenceThresholdDb = SILENCE_THRESHOLD_DB,
+  silenceDurationMs = SILENCE_DURATION_MS,
+  calibrationMs = NOISE_CALIBRATION_MS,
+  noiseMarginDb = NOISE_MARGIN_DB,
+  levelReportMs = DEFAULT_LEVEL_REPORT_MS,
   onError,
   onReady,
 } = {}) {
@@ -65,6 +143,9 @@ export function createPcmAudioCapture({
   let sinkNode = null;
   let running = false;
   let starting = null;
+
+  // Umbral realmente en uso. Arranca en el fijo y lo pisa la calibración.
+  let activeThresholdDb = silenceThresholdDb;
 
   /**
    * Crea el contexto pidiendo la frecuencia destino. Si el navegador rechaza el
@@ -112,6 +193,14 @@ export function createPcmAudioCapture({
         processorOptions: {
           targetSampleRate: TARGET_SAMPLE_RATE,
           chunkMs,
+          silenceThresholdDb,
+          silenceDurationMs,
+          calibrationMs,
+          noiseMarginDb,
+          minThresholdDb: MIN_THRESHOLD_DB,
+          maxThresholdDb: MAX_THRESHOLD_DB,
+          minCalibrationBlocks: MIN_CALIBRATION_BLOCKS,
+          levelReportMs,
         },
       });
 
@@ -121,6 +210,53 @@ export function createPcmAudioCapture({
 
         if (data.type === "chunk") {
           onAudioChunk(new Uint8Array(data.buffer));
+          return;
+        }
+
+        if (data.type === "calibrated") {
+          if (!data.ok) {
+            console.warn(
+              `[pcmAudioCapture] ⚠️ calibración descartada (${data.reason}, ` +
+                `${data.blocks} bloques): se usa el umbral fijo de ${data.thresholdDb} dBFS.`
+            );
+          } else {
+            activeThresholdDb = data.thresholdDb;
+            console.log(
+              `[pcmAudioCapture] 📏 piso de ruido ${data.floorDb.toFixed(1)} dBFS ` +
+                `(${data.blocks} bloques) + ${data.marginDb} dB de margen → umbral ` +
+                `${data.thresholdDb.toFixed(1)} dBFS`
+            );
+            if (data.clampedAt === "max") {
+              console.warn(
+                `[pcmAudioCapture] ⚠️ el umbral calculado (${data.rawThresholdDb.toFixed(1)} dBFS) ` +
+                  `quedó por encima del máximo permitido (${MAX_THRESHOLD_DB} dBFS) y se recortó. ` +
+                  "El ambiente puede ser demasiado ruidoso para esta técnica: el piso de ruido está " +
+                  "tan alto que se confunde con una voz normal, y el corte por silencio puede no " +
+                  "dispararse o dispararse a mitad de una frase."
+              );
+            } else if (data.clampedAt === "min") {
+              console.log(
+                `[pcmAudioCapture] el umbral calculado (${data.rawThresholdDb.toFixed(1)} dBFS) ` +
+                  `quedó por debajo del mínimo y se subió a ${MIN_THRESHOLD_DB} dBFS ` +
+                  "(ambiente muy silencioso, no es un problema)."
+              );
+            }
+          }
+          onCalibrated?.(data);
+          return;
+        }
+
+        if (data.type === "silence-detected") {
+          console.log(
+            `[pcmAudioCapture] 🔇 silencio sostenido: ${Math.round(data.silentMs)} ms ` +
+              `por debajo de ${data.thresholdDb.toFixed(1)} dBFS (último bloque ${data.db.toFixed(1)} dBFS)`
+          );
+          onSilenceDetected?.(data);
+          return;
+        }
+
+        if (data.type === "level") {
+          onLevel?.(data);
           return;
         }
 
@@ -156,6 +292,10 @@ export function createPcmAudioCapture({
         targetSampleRate: TARGET_SAMPLE_RATE,
         resampleRatio: audioContext.sampleRate / TARGET_SAMPLE_RATE,
         workletUrl: WORKLET_URL,
+        silenceThresholdDb,
+        silenceDurationMs,
+        calibrationMs,
+        noiseMarginDb,
       };
     })();
 
@@ -167,6 +307,20 @@ export function createPcmAudioCapture({
     } finally {
       starting = null;
     }
+  }
+
+  /**
+   * Rearma la detección de silencio para el turno siguiente: pone el contador en
+   * cero y vuelve a habilitar el aviso (el worklet lo manda una sola vez).
+   *
+   * Devuelve false si todavía no hay worklet — no es un error: un worklet recién
+   * creado ya nace con el contador en cero y el aviso habilitado, así que en ese
+   * caso el reset está cumplido por construcción.
+   */
+  function resetSilenceDetection() {
+    if (!workletNode) return false;
+    workletNode.port.postMessage({ type: "reset-silence-detection" });
+    return true;
   }
 
   async function stop() {
@@ -208,7 +362,10 @@ export function createPcmAudioCapture({
   return {
     start,
     stop,
+    resetSilenceDetection,
     isRunning: () => running,
+    /** Umbral en uso: el calibrado si la medición corrió, el fijo si no. */
+    getActiveThresholdDb: () => activeThresholdDb,
     getSampleRate: () => audioContext?.sampleRate ?? null,
   };
 }

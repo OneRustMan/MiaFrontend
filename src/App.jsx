@@ -3,7 +3,7 @@ import { Canvas } from "@react-three/fiber";
 import { Leva } from "leva";
 import { Experience } from "./components/Experience";
 import { UI } from "./components/UI";
-// ⚠️ TEMPORAL (paso 3a): disparador manual del chat en vivo. Sacar en 3c junto con el componente.
+// ⚠️ TEMPORAL (pasos 3a/3b): disparador manual del chat en vivo. Sacar en 3c junto con el componente.
 import { RealtimeChatDebugPanel } from "./components/RealtimeChatDebugPanel";
 
 function App() {
@@ -12,7 +12,7 @@ function App() {
       <Loader />
       <Leva hidden/>
       <UI />
-      {/* ⚠️ TEMPORAL (paso 3a) — sacar en 3c */}
+      {/* ⚠️ TEMPORAL (pasos 3a/3b) — sacar en 3c */}
       <RealtimeChatDebugPanel />
       <Canvas shadows camera={{ position: [0, 0, 1], fov: 30 }}>
         <Experience />
