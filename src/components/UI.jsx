@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useChat } from "../hooks/useChat";
+import { useRealtimeChat } from "../hooks/useRealtimeChat";
 
 // ========= Detección del backend =========
 function detectApiBase() {
@@ -69,11 +70,68 @@ async function resetSessionClient(reason = "frontend") {
 
 export const UI = ({ hidden, ...props }) => {
   const input = useRef(null);
-  const { chat, loading, cameraZoomed, setCameraZoomed, message } = useChat();
+  const { chat, loading, cameraZoomed, setCameraZoomed, message, enqueueMessage } = useChat();
 
   const [isRecording, setIsRecording] = useState(false);
   const [recordingUrl, setRecordingUrl] = useState(null);
   const [status, setStatus] = useState("");
+
+  // ================== SESIÓN EN VIVO (/chat/live) ==================
+  // isLive va desde que se aprieta "Hablar en vivo" hasta que la sesión termina
+  // sola. TODOS los finales del hook tienen que bajarlo — de eso se ocupan
+  // onDone y onError, que el hook garantiza que se llaman exactamente una vez.
+  //
+  // Pero isLive solo no alcanza para bloquear los botones: baja con el "done"
+  // del backend, que significa "terminé de GENERAR", no "MIA terminó de hablar".
+  // Cuando llega, la cola de reproducción todavía puede tener varios chunks por
+  // sonar. Por eso el bloqueo real es isLive || !!message: `message` es la
+  // cabeza de esa cola y vuelve a null recién cuando se reprodujo el último
+  // chunk (useChat.jsx). Es también lo que ya bloqueaba a "Send" desde antes.
+  //
+  // Se usa un estado propio en vez del `loading` de useChat porque ese `loading`
+  // significa "hay un fetch a /chat en vuelo": la sesión en vivo no pasa por ahí
+  // y mezclarlas dejaría a cada camino apagando el indicador del otro.
+  const [isLive, setIsLive] = useState(false);
+
+  const live = useRealtimeChat({
+    onChunk: (chunk) => {
+      // Misma cola que el chat por HTTP: el Avatar reproduce y anima igual.
+      enqueueMessage(chunk);
+      setStatus("MIA está respondiendo…");
+    },
+    onDone: (reason) => {
+      setIsLive(false);
+      if (reason === "skipped") setStatus("No se entendió lo que dijiste, probá de nuevo");
+      else if (reason === "aborted") setStatus("Sesión reiniciada");
+      else setStatus("Listo");
+    },
+    onError: (err, reason) => {
+      console.error(`[UI] sesión en vivo terminada por ${reason}:`, err);
+      setIsLive(false);
+      setStatus(`Se cortó la sesión en vivo: ${err.message}`);
+    },
+  });
+
+  // Bloqueo compartido: hay un turno en vuelo hasta que la cola quede vacía.
+  const isBusy = isLive || !!message;
+
+  const startLive = async () => {
+    if (isBusy || isRecording || loading) return;
+    // Se bloquea ANTES de pedir el micrófono: entre el permiso y la conexión hay
+    // tiempo de sobra para apretar el otro botón.
+    setIsLive(true);
+    setStatus("Escuchando…");
+    try {
+      await live.start();
+    } catch (err) {
+      // start() ya limpió lo suyo; acá solo hay que soltar la UI. Este camino no
+      // pasa por onError porque la sesión nunca llegó a existir.
+      console.error("[UI] no se pudo iniciar la sesión en vivo:", err);
+      setIsLive(false);
+      setStatus("No se pudo iniciar la sesión en vivo");
+    }
+  };
+  // =================================================================
 
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
@@ -111,6 +169,10 @@ export const UI = ({ hidden, ...props }) => {
     try {
       // Marca el corte ANTES de esperar: cualquier grabación previa queda stale.
       lastResetAtRef.current = Date.now();
+      // Primero se cierra la sesión en vivo propia y recién después se resetea.
+      // Al revés, el backend cortaría la generación y cerraría del otro lado,
+      // dejando de este lado un WebSocket y un micrófono huérfanos.
+      if (isLive) await live.stop();
       await resetSessionClient("manual-staff");
       setCounterSec(0);
     } finally {
@@ -206,7 +268,7 @@ export const UI = ({ hidden, ...props }) => {
 
   // Enviar: si la grabación es previa al último reset manual → NO se envía.
   const sendMessage = async () => {
-    if (loading || message) return;
+    if (loading || isBusy) return;
 
     // Solo se descarta la grabación si es anterior al último reset.
     const isStaleRecording =
@@ -293,14 +355,25 @@ export const UI = ({ hidden, ...props }) => {
         {/* Zona de grabación + envío */}
         <div className="flex items-center gap-3 pointer-events-auto max-w-screen-sm w-full mx-auto">
           <button
+            disabled={isBusy}
             onClick={toggleRecord}
             className={`p-4 px-6 font-semibold uppercase rounded-md transition
               ${isRecording
                 ? "bg-red-600 hover:bg-red-700 text-white"
                 : "bg-pink-500 hover:bg-pink-600 text-white"
-              }`}
+              } ${isBusy ? "cursor-not-allowed opacity-30" : ""}`}
           >
             {isRecording ? "⏺ Grabando…" : "🎙️ Grabar Audio"}
+          </button>
+
+          <button
+            disabled={isBusy || isRecording || loading}
+            onClick={startLive}
+            className={`bg-pink-500 hover:bg-pink-600 text-white p-4 px-6 font-semibold uppercase rounded-md ${
+              isBusy || isRecording || loading ? "cursor-not-allowed opacity-30" : ""
+            }`}
+          >
+            {isLive ? "🔴 En vivo…" : "🗣️ Hablar en vivo"}
           </button>
 
           <div className="flex flex-col items-start">
@@ -321,10 +394,10 @@ export const UI = ({ hidden, ...props }) => {
           </button>
 
           <button
-            disabled={loading || message}
+            disabled={loading || isBusy}
             onClick={sendMessage}
             className={`bg-pink-500 hover:bg-pink-600 text-white p-4 px-6 font-semibold uppercase rounded-md ${
-              loading || message ? "cursor-not-allowed opacity-30" : ""
+              loading || isBusy ? "cursor-not-allowed opacity-30" : ""
             }`}
           >
             Send

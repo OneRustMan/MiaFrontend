@@ -2,10 +2,17 @@
 //
 // Sesión de chat en vivo contra el WebSocket /chat/live del backend.
 //
-// Alcance hasta acá (3a + 3b): abrir el socket, pedir el micrófono, mandar el
-// audio en PCM crudo chunk por chunk y cortar el turno solo al detectar silencio.
-// Los mensajes que devuelve el servidor se LOGUEAN tal cual y nada más —
-// procesarlos (reproducir el audio de MIA, mover el avatar) es el paso 3c.
+// Alcance completo de la feature (3a + 3b + 3c): abre el socket, pide el
+// micrófono, manda el audio en PCM crudo chunk por chunk, corta el turno solo
+// cuando detecta silencio, y entrega la respuesta de MIA ya lista para reproducir.
+//
+// Lo que este hook NO hace es reproducir audio ni animar al avatar. Los chunks
+// que devuelve /chat/live tienen exactamente el mismo shape que los del SSE de
+// /chat — los dos salen de runTurnPipeline() en el backend, así que los dos
+// traen { text, audio, lipsync, facialExpression, animation } — por eso acá se
+// entregan crudos por onChunk y quien los consume los empuja a la cola de
+// reproducción que ya existe en useChat.jsx. Una sola cola y un solo Avatar para
+// los dos caminos.
 //
 // ─── Cómo se corta el turno (3b) ─────────────────────────────────────────────
 // Hay tres caminos que llevan al mismo commit, y solo el PRIMERO en llegar vale:
@@ -18,6 +25,17 @@
 //
 // El guard es committedRef: mandar dos commits para el mismo turno le pediría al
 // backend dos respuestas por un solo audio. Se baja únicamente en start().
+//
+// ─── Cómo termina la sesión (3c) ─────────────────────────────────────────────
+// La sesión se apaga sola, y ese apagado es lo único que libera la UI. El backend
+// tiene CUATRO terminadores posibles — done, skipped (transcripción vacía),
+// aborted (un /reset invalidó la generación) y error — más un quinto que no manda
+// nadie: que el socket se caiga. Los cinco desembocan en finishSession(), que
+// cierra todo y avisa una sola vez hacia arriba.
+//
+// Que estén los cinco no es exceso: quien llame a este hook va a bloquear botones
+// mientras la sesión está viva, así que un terminador que no avise deja esos
+// botones trabados para siempre esperando un evento que ya no va a llegar.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -37,17 +55,25 @@ const LOG = "[useRealtimeChat]";
 const MAX_LISTEN_MS = 45000;
 
 /**
- * ⚠️ TEMPORAL (3b) — cada cuánto reporta el worklet el nivel medido, para poder
- * calibrar el umbral mirando la consola. Se pone en 0 (o se saca) en 3c.
+ * @param {object} [handlers]
+ * @param {(chunk: object) => void} [handlers.onChunk]  Un chunk de respuesta de MIA, listo para
+ *        encolar tal cual ({ text, audio, lipsync, facialExpression, animation }).
+ * @param {(reason: string) => void} [handlers.onDone]  La sesión terminó bien. `reason` es
+ *        "done" | "skipped" | "aborted" | "stop", para que la UI diga qué pasó.
+ * @param {(err: Error, reason: string) => void} [handlers.onError]  La sesión terminó mal.
  */
-const LEVEL_REPORT_MS = 250;
-
-export function useRealtimeChat() {
+export function useRealtimeChat({ onChunk, onDone, onError } = {}) {
   const wsRef = useRef(null);
   const captureRef = useRef(null);
   const streamRef = useRef(null);
   // Evita que un stop() en curso se pise con un start() nuevo.
   const startingRef = useRef(false);
+
+  // Los handlers se guardan en un ref y se refrescan en cada render: los eventos
+  // del socket llegan mucho después de haberse registrado, y sin esto ejecutarían
+  // la versión vieja del callback (con el estado viejo capturado adentro).
+  const handlersRef = useRef({});
+  handlersRef.current = { onChunk, onDone, onError };
 
   const [status, setStatus] = useState("idle");
   const [isRunning, setIsRunning] = useState(false);
@@ -60,11 +86,8 @@ export function useRealtimeChat() {
   const committedRef = useRef(false);
   const maxListenTimerRef = useRef(null);
 
-  // ⚠️ TEMPORAL (3b) — último nivel medido, solo para el panel de calibración.
-  const [level, setLevel] = useState(null);
-  // ⚠️ TEMPORAL (3b) — resultado de la medición del piso de ruido de la sesión.
-  const [calibration, setCalibration] = useState(null);
-  const [committed, setCommitted] = useState(false);
+  // Guard de la sesión: la sesión termina UNA sola vez, avise quien avise.
+  const finishedRef = useRef(false);
 
   const clearMaxListenTimer = useCallback(() => {
     if (maxListenTimerRef.current) {
@@ -90,7 +113,6 @@ export function useRealtimeChat() {
       }
 
       committedRef.current = true;
-      setCommitted(true);
       clearMaxListenTimer();
 
       ws.send(JSON.stringify({ type: "commit" }));
@@ -123,6 +145,9 @@ export function useRealtimeChat() {
     const ws = wsRef.current;
     wsRef.current = null;
     if (ws) {
+      // Los handlers se sueltan ANTES de cerrar: el close que viene a
+      // continuación es el nuestro, y no tiene que volver por onclose a
+      // reportarse como caída inesperada.
       ws.onmessage = null;
       ws.onerror = null;
       ws.onclose = null;
@@ -136,6 +161,31 @@ export function useRealtimeChat() {
     setStatus("idle");
   }, [clearMaxListenTimer]);
 
+  /**
+   * Terminador único de la sesión: cierra todo y avisa una sola vez hacia arriba.
+   * Todos los finales (done, skipped, aborted, error del backend, caída del
+   * socket y stop() manual) pasan por acá, para que ninguno pueda dejar la UI
+   * esperando un evento que ya no va a llegar.
+   */
+  const finishSession = useCallback(
+    async (reason, error) => {
+      if (finishedRef.current) return;
+      finishedRef.current = true;
+
+      if (error) {
+        console.error(`${LOG} 🏁 sesión terminada por ${reason}:`, error);
+      } else {
+        console.log(`${LOG} 🏁 sesión terminada por ${reason}.`);
+      }
+
+      await teardown(reason);
+
+      if (error) handlersRef.current.onError?.(error, reason);
+      else handlersRef.current.onDone?.(reason);
+    },
+    [teardown]
+  );
+
   const start = useCallback(async () => {
     if (wsRef.current || startingRef.current) {
       console.warn(`${LOG} start() ignorado: ya hay una sesión en curso.`);
@@ -145,9 +195,7 @@ export function useRealtimeChat() {
     sentChunksRef.current = 0;
     sentBytesRef.current = 0;
     committedRef.current = false;
-    setCommitted(false);
-    setLevel(null);
-    setCalibration(null);
+    finishedRef.current = false;
 
     try {
       setStatus("pidiendo micrófono");
@@ -169,28 +217,10 @@ export function useRealtimeChat() {
           ws.send(chunk);
           sentChunksRef.current += 1;
           sentBytesRef.current += chunk.byteLength;
-          console.log(
-            `${LOG} 📤 chunk #${sentChunksRef.current}: ${chunk.byteLength} bytes ` +
-              `(total ${sentBytesRef.current} bytes)`
-          );
         },
         // El corte de turno automático: el worklet avisa una sola vez y el guard
         // de commitTurn() se ocupa de que un silencio posterior no repita nada.
         onSilenceDetected: () => commitTurn("silencio"),
-        // ⚠️ TEMPORAL (3b) — el piso medido se muestra en el panel para calibrar.
-        onCalibrated: (info) => setCalibration(info),
-        // ⚠️ TEMPORAL (3b) — nivel en vivo para calibrar el umbral.
-        levelReportMs: LEVEL_REPORT_MS,
-        onLevel: (info) => {
-          setLevel(info);
-          console.log(
-            `${LOG} 🎚️ ${info.db.toFixed(1)} dBFS ` +
-              (info.calibrating
-                ? "(midiendo el ambiente…)"
-                : `${info.silent ? `(silencio ${Math.round(info.silentMs)} ms)` : "(voz)"} ` +
-                  `[umbral ${info.thresholdDb.toFixed(1)}]`)
-          );
-        },
         onError: (err) => console.error(`${LOG} error de captura:`, err),
       });
       captureRef.current = capture;
@@ -198,9 +228,7 @@ export function useRealtimeChat() {
       ws.onopen = async () => {
         console.log(`${LOG} ✅ WebSocket abierto.`);
         try {
-          // Turno nuevo: el contador de silencio arranca de cero. Sobre una
-          // captura recién creada devuelve false y no hace falta (nace en cero),
-          // pero es el mismo llamado que va a rearmar el turno siguiente en 3c.
+          // Turno nuevo: el contador de silencio arranca de cero.
           capture.resetSilenceDetection();
 
           // El backend bufferea el audio que llega antes de que la sesión de
@@ -219,18 +247,16 @@ export function useRealtimeChat() {
           }, MAX_LISTEN_MS);
         } catch (err) {
           console.error(`${LOG} no se pudo iniciar la captura:`, err);
-          setStatus("error de captura");
-          await teardown("fallo de captura");
+          await finishSession("fallo de captura", err);
         }
       };
 
-      // Todo lo que manda el servidor se loguea crudo, sin procesar:
-      // ready / transcript.delta / transcript / skipped / chunk / done / aborted / error.
       ws.onmessage = (event) => {
         if (typeof event.data !== "string") {
           console.log(`${LOG} ⬅️ mensaje binario del servidor (${event.data.byteLength} bytes)`);
           return;
         }
+
         let parsed;
         try {
           parsed = JSON.parse(event.data);
@@ -238,27 +264,76 @@ export function useRealtimeChat() {
           console.log(`${LOG} ⬅️ mensaje no-JSON:`, event.data);
           return;
         }
-        console.log(`${LOG} ⬅️ ${parsed.type}`, parsed);
+
+        switch (parsed.type) {
+          case "chunk": {
+            // Se le saca el discriminador y lo que queda es exactamente lo que
+            // espera la cola de reproducción.
+            const { type, ...message } = parsed;
+            console.log(`${LOG} ⬅️ chunk: "${message.text}"`);
+            setStatus("respondiendo");
+            handlersRef.current.onChunk?.(message);
+            break;
+          }
+
+          case "done":
+            finishSession("done");
+            break;
+
+          // Transcripción vacía: el backend NO manda done después de esto, así
+          // que si no se cerrara acá la sesión quedaría viva sin nada que esperar.
+          case "skipped":
+            console.warn(`${LOG} ⬅️ turno descartado: ${parsed.reason}`);
+            finishSession("skipped");
+            break;
+
+          // Un /reset invalidó esta generación mientras el turno corría.
+          case "aborted":
+            finishSession("aborted");
+            break;
+
+          case "error":
+            finishSession("error", new Error(parsed.error || "error del servidor"));
+            break;
+
+          // Informativos: transcripción parcial y final, y el aviso de sesión lista.
+          case "ready":
+          case "transcript":
+          case "transcript.delta":
+            console.log(`${LOG} ⬅️ ${parsed.type}`, parsed);
+            break;
+
+          default:
+            console.log(`${LOG} ⬅️ ${parsed.type} (sin manejo)`, parsed);
+        }
       };
 
       ws.onerror = (event) => {
+        // El navegador no expone el motivo por seguridad; el onclose que viene
+        // atrás sí trae el código, así que el cierre lo maneja aquel.
         console.error(`${LOG} ❌ error de WebSocket:`, event);
-        setStatus("error de websocket");
       };
 
       ws.onclose = (event) => {
-        console.log(`${LOG} 🔌 WebSocket cerrado (${event.code} ${event.reason || ""}).`);
-        teardown("socket cerrado");
+        // teardown() suelta este handler antes de cerrar, así que si este código
+        // corre es porque cerró el otro lado: backend caído, red, o un close que
+        // no vino precedido de ningún terminador.
+        console.warn(`${LOG} 🔌 el servidor cerró el WebSocket (${event.code} ${event.reason || ""}).`);
+        finishSession(
+          "desconexión",
+          new Error(
+            `La conexión con MIA se cortó (código ${event.code}${event.reason ? `: ${event.reason}` : ""})`
+          )
+        );
       };
     } catch (err) {
       console.error(`${LOG} no se pudo arrancar la sesión:`, err);
-      setStatus("error");
       await teardown("fallo al arrancar");
       throw err;
     } finally {
       startingRef.current = false;
     }
-  }, [teardown, commitTurn, clearMaxListenTimer]);
+  }, [teardown, finishSession, commitTurn, clearMaxListenTimer]);
 
   /**
    * Corte de turno manual. Desde 3b el camino normal es el silencio automático;
@@ -271,27 +346,17 @@ export function useRealtimeChat() {
 
   const stop = useCallback(async () => {
     console.log(`${LOG} 🛑 stop() — cerrando captura y WebSocket.`);
-    await teardown("stop del cliente");
-  }, [teardown]);
+    await finishSession("stop");
+  }, [finishSession]);
 
   // Si el componente se desmonta con la sesión abierta, no dejar el micrófono ni
-  // el AudioContext colgados.
+  // el AudioContext colgados. Va directo a teardown: el componente que esperaba
+  // el aviso ya no está.
   useEffect(() => {
     return () => { teardown("componente desmontado"); };
   }, [teardown]);
 
-  return {
-    start,
-    stop,
-    sendCommit,
-    status,
-    isRunning,
-    liveChatUrl,
-    // ⚠️ TEMPORAL (3b) — solo los consume el panel de calibración.
-    level,
-    committed,
-    calibration,
-  };
+  return { start, stop, sendCommit, status, isRunning, liveChatUrl };
 }
 
 export default useRealtimeChat;

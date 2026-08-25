@@ -52,7 +52,7 @@ const DEFAULT_CHUNK_MS = 100;
 export const SILENCE_THRESHOLD_DB = -50;
 
 /** Cuánto silencio consecutivo hace falta para cortar el turno. */
-export const SILENCE_DURATION_MS = 2500;
+export const SILENCE_DURATION_MS = 500;
 
 /** Cuánto audio se mide al arrancar para estimar el piso de ruido. */
 export const NOISE_CALIBRATION_MS = 1000;

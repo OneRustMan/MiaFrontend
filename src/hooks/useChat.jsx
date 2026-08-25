@@ -81,6 +81,23 @@ export const ChatProvider = ({ children }) => {
     setMessages((messages) => messages.slice(1));
   };
 
+  /**
+   * Empuja un mensaje ya armado al final de la MISMA cola que alimenta al chat
+   * por HTTP. `messages` es la cola, `message` es su cabeza y el Avatar reproduce
+   * la cabeza; agregar al final es todo lo que hace falta para que un mensaje
+   * suene y anime igual que los del /chat de siempre.
+   *
+   * Existe para la sesión en vivo (/chat/live): sus chunks llegan por WebSocket
+   * pero salen del mismo turnPipeline del backend, así que tienen exactamente el
+   * shape que espera el Avatar ({ text, audio, lipsync, facialExpression,
+   * animation }). Reconstruir una segunda reproducción para ese camino habría
+   * significado dos colas y dos formas de animar al mismo avatar.
+   */
+  const enqueueMessage = (msg) => {
+    if (!msg) return;
+    setMessages((messages) => [...messages, msg]);
+  };
+
   useEffect(() => {
     if (messages.length > 0) {
       setMessage(messages[0]);
@@ -95,6 +112,7 @@ export const ChatProvider = ({ children }) => {
         chat,
         message,
         onMessagePlayed,
+        enqueueMessage,
         loading,
         cameraZoomed,
         setCameraZoomed,
